@@ -22,6 +22,7 @@ PROXY_HOST=${PROXY_HOST:-127.0.0.1}
 # The regexp here is far from precise, but good enough.
 IP_REGEXP="[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}"
 CIDR_REGEXP="$IP_REGEXP/[0-9]{1,2}"
+PROG_NAME=$0
 
 usage() {
     echo "Usage:"
@@ -42,6 +43,7 @@ usage() {
     echo "weave expose       [<addr> ...] [-h <fqdn>]"
     echo "weave hide         [<addr> ...]"
     echo "weave ps           [<container_id> ...]"
+    echo "weave build        [-F <dockerFile>] [<addr> ...] [docker_build_args ...]"
     echo "weave status"
     echo "weave proxy-env"
     echo "weave proxy-config"
@@ -146,12 +148,20 @@ if [ "$1" = "run" ] ; then
     exec_remote attach $CIDR_ARGS --or-die $CONTAINER >/dev/null
     echo $CONTAINER
     exit 0
+elif [ "$1" = "build" ] ; then
+    # "build" is special case because dockerfile are on the local system
+    # builds can still be built remotely but the entry point has to be local
+    # keep build in the args hack
+    echo "building"
 elif [ "$1" != "--local" ] ; then
     exec_remote "$@"
     exit $?
 fi
 
-shift 1
+# only shift if command is not build
+if [ "$1" != "build" ] ; then
+    shift 1
+fi
 
 BASE_IMAGE=$DOCKERHUB_USER/weave
 BASE_DNS_IMAGE=$DOCKERHUB_USER/weavedns
@@ -1179,6 +1189,45 @@ case "$COMMAND" in
         with_container_netns$ATTACH_TYPE $CONTAINER attach $ALL_CIDRS >/dev/null
         when_dns_running with_container_fqdn $CONTAINER put_dns_fqdn $ALL_CIDRS
         show_addrs $ALL_CIDRS
+        ;;
+     build)
+        if [ "$1" = "-f" ]; then
+            DOCKER_FILE=$2
+            shift 2
+        else
+            echo "dockerfile needs to be first argument"
+            usage
+        fi
+        collect_cidr_args "$@"
+        shift $CIDR_ARG_COUNT
+        # what remains are build args
+        BUILD_ARGS="$@"
+        # modify dockerfile
+        TEMP_DOCKERFILE=./$RANDOM
+        # using _ for / in sed here to avoid having to escape the /
+        # this line is perpended to RUN line of the dockerfile
+        # it ensures network is up before running the command
+        sed s_^run_'RUN until grep -q ethwe /proc/net/dev; do sleep 1; done;'_gI $DOCKER_FILE > $TEMP_DOCKERFILE
+        # save IP args
+        RUN_ATTACH=no
+        docker build -f $TEMP_DOCKERFILE $BUILD_ARGS . | while read LINE; do
+            echo $LINE
+            if [ "$RUN_ATTACH" = "yes" ]; then
+              RUN_ATTACH="no";
+              # ensure this is not cached line
+              if echo $LINE | grep -q "Running in"; then
+                # get container ID from line
+                CONTAINER_ID=$(echo $LINE | sed s/'.*Running in '//)
+                # attach IP's to that container, ignore output
+                $PROG_NAME attach $CIDR_ARGS $CONTAINER_ID > /dev/null
+              fi
+            elif echo $LINE | grep -q 'Step .* : RUN'; then
+              # flag next line for attach
+              RUN_ATTACH="yes";
+            fi
+        done
+        # rm temp file
+
         ;;
     detach)
         collect_cidr_args "$@"
